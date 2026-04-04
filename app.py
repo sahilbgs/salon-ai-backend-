@@ -18,28 +18,54 @@ app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='')
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 FIREBASE_KEY_PATH = os.environ.get("FIREBASE_KEY_PATH", os.path.join(os.path.dirname(__file__), "serviceAccountKey.json"))
-FIREBASE_KEY_JSON = os.environ.get("FIREBASE_KEY_JSON")
+# Support multiple env var names for flexibility
+FIREBASE_KEY_JSON = os.environ.get("FIREBASE_KEY_JSON") or os.environ.get("FIREBASE_CREDENTIALS") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
 db = None
+_init_method = "none"
 
 try:
     if FIREBASE_KEY_JSON:
+        print(f"Found Firebase JSON env var ({len(FIREBASE_KEY_JSON)} chars), parsing...")
         key_data = json.loads(FIREBASE_KEY_JSON)
+        print(f"Parsed JSON successfully. Project: {key_data.get('project_id', 'unknown')}")
         cred = credentials.Certificate(key_data)
         firebase_admin.initialize_app(cred)
         db = firestore.client()
-        print("Firebase Admin SDK initialized from FIREBASE_KEY_JSON.")
+        _init_method = "env_var"
+        print("Firebase Admin SDK initialized from environment variable.")
     elif os.path.exists(FIREBASE_KEY_PATH):
         cred = credentials.Certificate(FIREBASE_KEY_PATH)
         firebase_admin.initialize_app(cred)
         db = firestore.client()
+        _init_method = "file"
         print("Firebase Admin SDK initialized from FIREBASE_KEY_PATH.")
     else:
-        print(f"WARNING: Firebase key not found at {FIREBASE_KEY_PATH} and FIREBASE_KEY_JSON is not set.")
+        print(f"WARNING: Firebase key not found at {FIREBASE_KEY_PATH}")
+        print(f"  FIREBASE_KEY_JSON set: {bool(os.environ.get('FIREBASE_KEY_JSON'))}")
+        print(f"  FIREBASE_CREDENTIALS set: {bool(os.environ.get('FIREBASE_CREDENTIALS'))}")
         db = None
+except json.JSONDecodeError as e:
+    print(f"ERROR: Failed to parse Firebase JSON: {e}")
+    db = None
 except Exception as e:
     print(f"Error initializing Firebase: {e}")
+    import traceback
+    traceback.print_exc()
     db = None
+
+@app.route('/api/health')
+def health_check():
+    return jsonify({
+        "status": "ok",
+        "db_initialized": db is not None,
+        "init_method": _init_method,
+        "env_vars_present": {
+            "FIREBASE_KEY_JSON": bool(os.environ.get("FIREBASE_KEY_JSON")),
+            "FIREBASE_CREDENTIALS": bool(os.environ.get("FIREBASE_CREDENTIALS")),
+            "FIREBASE_KEY_PATH": os.environ.get("FIREBASE_KEY_PATH", "(default)")
+        }
+    }), 200
 
 def send_notification(token, title, body):
     if not token: return
