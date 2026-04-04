@@ -75,9 +75,6 @@ def send_notification(token, title, body):
     except Exception as e:
         print(f"FCM Error: {e}")
 
-@app.route('/')
-def health_check():
-    return jsonify({"status": "ok", "message": "Salon AI backend is running"}), 200
 
 # ==================== AUTH ====================
 
