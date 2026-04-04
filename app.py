@@ -1,5 +1,6 @@
 import os
 import math
+import json
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import firebase_admin
@@ -17,15 +18,24 @@ app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='')
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 FIREBASE_KEY_PATH = os.environ.get("FIREBASE_KEY_PATH", os.path.join(os.path.dirname(__file__), "serviceAccountKey.json"))
+FIREBASE_KEY_JSON = os.environ.get("FIREBASE_KEY_JSON")
+
+db = None
 
 try:
-    if os.path.exists(FIREBASE_KEY_PATH):
+    if FIREBASE_KEY_JSON:
+        key_data = json.loads(FIREBASE_KEY_JSON)
+        cred = credentials.Certificate(key_data)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        print("Firebase Admin SDK initialized from FIREBASE_KEY_JSON.")
+    elif os.path.exists(FIREBASE_KEY_PATH):
         cred = credentials.Certificate(FIREBASE_KEY_PATH)
         firebase_admin.initialize_app(cred)
         db = firestore.client()
-        print("Firebase Admin SDK initialized.")
+        print("Firebase Admin SDK initialized from FIREBASE_KEY_PATH.")
     else:
-        print(f"WARNING: Firebase key not found at {FIREBASE_KEY_PATH}.")
+        print(f"WARNING: Firebase key not found at {FIREBASE_KEY_PATH} and FIREBASE_KEY_JSON is not set.")
         db = None
 except Exception as e:
     print(f"Error initializing Firebase: {e}")
@@ -38,6 +48,10 @@ def send_notification(token, title, body):
         messaging.send(msg)
     except Exception as e:
         print(f"FCM Error: {e}")
+
+@app.route('/')
+def health_check():
+    return jsonify({"status": "ok", "message": "Salon AI backend is running"}), 200
 
 # ==================== AUTH ====================
 
