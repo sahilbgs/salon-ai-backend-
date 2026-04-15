@@ -1,6 +1,8 @@
 Flask==3.0.0
 firebase-admin==6.4.0
 Flask-CORS==4.0.0
+Flask-Compress==1.15
 gunicorn==21.2.0
 qrcode[pil]==8.0
 Pillow==11.0.0
+requests==2.31.0

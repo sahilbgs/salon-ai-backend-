@@ -1,8 +1,12 @@
 import os
 import math
 import json
+import time
+import threading
+import requests as http_requests
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
+from flask_compress import Compress
 import firebase_admin
 from firebase_admin import credentials, auth, firestore, messaging
 from datetime import datetime
@@ -16,6 +20,27 @@ from utils.auth_helpers import verify_token, get_user_role, haversine
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend')
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='')
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+Compress(app)  # Shrink JSON responses by 60-80% with gzip compression
+
+# ── Render free-plan keep-alive: ping /api/health every 14 min ──
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://salon-ai-backend-306m.onrender.com")
+
+def _keep_alive():
+    """Prevents Render free-plan spin-down by self-pinging every 14 minutes."""
+    time.sleep(60)  # wait for app to fully boot first
+    while True:
+        try:
+            if RENDER_URL:
+                http_requests.get(f"{RENDER_URL}/api/health", timeout=10)
+                print("[keep-alive] pinged /api/health")
+        except Exception as e:
+            print(f"[keep-alive] ping failed: {e}")
+        time.sleep(840)  # 14 minutes
+
+threading.Thread(target=_keep_alive, daemon=True).start()
+
+# ── Simple 30-second in-memory cache for /api/salons (non-location requests) ──
+_salons_cache = {"data": None, "ts": 0}
 
 FIREBASE_KEY_PATH = os.environ.get("FIREBASE_KEY_PATH", os.path.join(os.path.dirname(__file__), "serviceAccountKey.json"))
 # Support multiple env var names for flexibility
@@ -132,10 +157,27 @@ def get_salons():
     lat = request.args.get('lat', type=float)
     lng = request.args.get('lng', type=float)
     if db is None: return jsonify({"error": "DB not initialized"}), 500
+
+    # Return cached response for non-location requests (avoids Firestore reads)
+    now = time.time()
+    if not lat and not lng:
+        if _salons_cache["data"] and now - _salons_cache["ts"] < 30:
+            return jsonify(_salons_cache["data"]), 200
+
     try:
-        docs = db.collection('salons').where('status', '==', 'approved').stream()
+        salon_docs = list(db.collection('salons').where('status', '==', 'approved').stream())
+
+        # ── Batch-fetch all queue docs in ONE read instead of N reads ──
+        salon_ids = [doc.id for doc in salon_docs]
+        queue_refs = [db.collection('queues').document(sid) for sid in salon_ids]
+        queue_snap_map = {}
+        if queue_refs:
+            for q_doc in db.get_all(queue_refs):
+                if q_doc.exists:
+                    queue_snap_map[q_doc.id] = q_doc.to_dict()
+
         salons = []
-        for doc in docs:
+        for doc in salon_docs:
             data = doc.to_dict()
             data['id'] = doc.id
             if lat and lng and 'location' in data:
@@ -143,13 +185,19 @@ def get_salons():
                 data['distance'] = haversine(lat, lng, slat, slng) if slat and slng else float('inf')
             else:
                 data['distance'] = float('inf')
-            # Attach queue info
-            _, q = get_or_create_queue(db, doc.id)
-            data['queue_length'] = q.get('last_token',0) - q.get('current_token',0)
+            # Attach queue info from pre-fetched batch
+            q = queue_snap_map.get(doc.id, {})
+            data['queue_length'] = q.get('last_token', 0) - q.get('current_token', 0)
             data['current_token'] = q.get('current_token', 0)
             salons.append(data)
+
         if lat and lng:
             salons.sort(key=lambda x: x.get('distance', float('inf')))
+
+        # Update cache only for non-location responses
+        if not lat and not lng:
+            _salons_cache.update({"data": salons, "ts": now})
+
         return jsonify(salons), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -192,14 +240,13 @@ def book_appointment():
         if salon_doc.exists:
             auto_confirm_limit = salon_doc.to_dict().get('auto_confirm_limit', 10)
 
-        # Count existing confirmed bookings for this shift today (single-field query, filter in Python)
-        all_salon_bookings = db.collection('bookings').where('salon_id', '==', salon_id).stream()
-        confirmed_count = sum(
-            1 for b in all_salon_bookings
-            if b.to_dict().get('date') == date
-            and b.to_dict().get('time') == time_slot
-            and b.to_dict().get('status') in ['confirmed', 'in_progress', 'arrived']
-        )
+        # Count confirmed bookings for this slot from the queue doc's counter (zero extra reads)
+        queue_ref = db.collection('queues').document(salon_id)
+        queue_doc = queue_ref.get()
+        slot_key = f"confirmed_count_{date}_{time_slot.replace(':', '')}"
+        confirmed_count = 0
+        if queue_doc.exists:
+            confirmed_count = queue_doc.to_dict().get(slot_key, 0)
 
         # Auto-confirm if under limit, else pending
         booking_status = 'confirmed' if confirmed_count < auto_confirm_limit else 'pending'
@@ -229,6 +276,10 @@ def book_appointment():
         new_booking['service_name'] = service_name
 
         _, doc_ref = db.collection('bookings').add(new_booking)
+
+        # Increment per-slot confirmed counter on the queue doc (zero-cost, no extra reads)
+        if booking_status in ('confirmed', 'in_progress', 'arrived'):
+            queue_ref.set({slot_key: firestore.Increment(1)}, merge=True)
 
         # ── Notify owner via FCM topic (works even when app is closed) ──
         topic = f'salon_{salon_id}'
@@ -597,12 +648,125 @@ def add_service():
         salon_doc = db.collection('salons').document(salon_id).get()
         if not salon_doc.exists or salon_doc.to_dict().get('owner_id') != uid:
             return jsonify({"error": "Unauthorized"}), 403
-        svc = {"salon_id": salon_id, "name": data.get('name'),
-               "price": data.get('price'), "duration": data.get('duration')}
+        svc = {
+            "salon_id": salon_id,
+            "name": data.get('name'),
+            "price": data.get('price'),
+            "duration": data.get('duration'),
+            "category": data.get('category', ''),
+            "description": data.get('description', ''),
+            "image_url": data.get('image_url', ''),
+        }
         _, doc_ref = db.collection('services').add(svc)
         return jsonify({"message": "Service added", "id": doc_ref.id}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/services', methods=['GET'])
+def get_all_services():
+    """
+    Get all services across all approved salons.
+    Optional query params:
+      - salon_id : filter by a specific salon
+      - category : filter by category name (case-insensitive)
+    Returns each service with its salon's name and address attached.
+    """
+    if db is None: return jsonify({"error": "DB not initialized"}), 500
+    salon_id_filter = request.args.get('salon_id')
+    category_filter = request.args.get('category', '').strip().lower()
+    try:
+        # Fetch services
+        if salon_id_filter:
+            svc_docs = db.collection('services').where('salon_id', '==', salon_id_filter).stream()
+        else:
+            svc_docs = db.collection('services').stream()
+
+        services = []
+        salon_cache = {}  # avoid re-fetching the same salon doc
+
+        for doc in svc_docs:
+            svc = {"id": doc.id, **doc.to_dict()}
+
+            # Apply category filter in Python (avoids composite index requirement)
+            if category_filter and svc.get('category', '').lower() != category_filter:
+                continue
+
+            # Attach salon name + address for display in the Services page
+            sid = svc.get('salon_id', '')
+            if sid:
+                if sid not in salon_cache:
+                    s_doc = db.collection('salons').document(sid).get()
+                    salon_cache[sid] = s_doc.to_dict() if s_doc.exists else {}
+                salon_info = salon_cache[sid]
+                svc['salon_name'] = salon_info.get('name', '')
+                svc['salon_address'] = salon_info.get('address', '')
+                svc['salon_status'] = salon_info.get('status', '')
+
+            # Only surface services from approved salons
+            if svc.get('salon_status', 'approved') != 'approved':
+                continue
+
+            services.append(svc)
+
+        return jsonify(services), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/services/<salon_id>', methods=['GET'])
+def get_salon_services(salon_id):
+    """Get all services for a specific salon (dedicated endpoint, no auth required)."""
+    if db is None: return jsonify({"error": "DB not initialized"}), 500
+    try:
+        docs = db.collection('services').where('salon_id', '==', salon_id).stream()
+        return jsonify([{"id": d.id, **d.to_dict()} for d in docs]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/service/<service_id>', methods=['DELETE'])
+def delete_service(service_id):
+    """Owner: delete one of their services."""
+    decoded, err = verify_token()
+    if err: return jsonify({"error": err}), 401
+    uid = decoded['uid']
+    if get_user_role(db, uid) != 'owner': return jsonify({"error": "Owners only"}), 403
+    try:
+        doc_ref = db.collection('services').document(service_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Service not found"}), 404
+        # Verify the service belongs to one of the owner's salons
+        salon_doc = db.collection('salons').document(doc.to_dict().get('salon_id', '')).get()
+        if not salon_doc.exists or salon_doc.to_dict().get('owner_id') != uid:
+            return jsonify({"error": "Unauthorized"}), 403
+        doc_ref.delete()
+        return jsonify({"message": "Service deleted"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/service/<service_id>', methods=['PUT'])
+def update_service(service_id):
+    """Owner: update an existing service."""
+    decoded, err = verify_token()
+    if err: return jsonify({"error": err}), 401
+    uid = decoded['uid']
+    if get_user_role(db, uid) != 'owner': return jsonify({"error": "Owners only"}), 403
+    data = request.json
+    try:
+        doc_ref = db.collection('services').document(service_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Service not found"}), 404
+        salon_doc = db.collection('salons').document(doc.to_dict().get('salon_id', '')).get()
+        if not salon_doc.exists or salon_doc.to_dict().get('owner_id') != uid:
+            return jsonify({"error": "Unauthorized"}), 403
+        allowed = ['name', 'price', 'duration', 'category', 'description', 'image_url']
+        updates = {k: v for k, v in data.items() if k in allowed}
+        doc_ref.update(updates)
+        return jsonify({"message": "Service updated"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 
 @app.route('/api/owner/salons', methods=['GET'])
 def get_owner_salons():
@@ -767,4 +931,6 @@ def serve_frontend(path):
     return send_from_directory(FRONTEND_DIR, 'index.html')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', debug=True, port=5000)
+    # Use debug=True only locally; on Render, gunicorn is the entrypoint.
+    # Start command: gunicorn app:app --workers 1 --threads 2 --timeout 120
+    app.run(host='0.0.0.0', debug=False, port=5000)

@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: salon-ai-backend
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 2 --timeout 120
+    envVars:
+      - key: FIREBASE_KEY_JSON
+        sync: false          # Set manually in Render dashboard (secret)
+      - key: RENDER_EXTERNAL_URL
+        # Render auto-populates this with your service's public URL.
+        # The keep-alive thread uses it to self-ping /api/health every 14 min.
+        fromService:
+          type: web
+          name: salon-ai-backend
+          property: host
