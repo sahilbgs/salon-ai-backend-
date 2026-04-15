@@ -449,49 +449,6 @@ def owner_clear_queue():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/owner/set-auto-confirm', methods=['POST'])
-def set_auto_confirm():
-    """Owner: set the auto-confirm limit per shift for their salon."""
-    decoded, err = verify_token()
-    if err: return jsonify({"error": err}), 401
-    if get_user_role(db, decoded['uid']) != 'owner':
-        return jsonify({"error": "Owners only"}), 403
-    data = request.json
-    salon_id = data.get('salon_id')
-    limit = data.get('limit')
-    if salon_id is None or limit is None:
-        return jsonify({"error": "salon_id and limit required"}), 400
-    salon_doc = db.collection('salons').document(salon_id).get()
-    if not salon_doc.exists or salon_doc.to_dict().get('owner_id') != decoded['uid']:
-        return jsonify({"error": "Not your salon"}), 403
-    try:
-        db.collection('salons').document(salon_id).update({
-            "auto_confirm_limit": int(limit)
-        })
-        return jsonify({"message": f"Auto-confirm limit set to {limit}"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/owner/update-salon-status', methods=['POST'])
-def update_salon_status():
-    """Owner: toggle salon open/closed status."""
-    decoded, err = verify_token()
-    if err: return jsonify({"error": err}), 401
-    if get_user_role(db, decoded['uid']) != 'owner':
-        return jsonify({"error": "Owners only"}), 403
-    data = request.json
-    salon_id = data.get('salon_id')
-    is_open = data.get('is_open')
-    if salon_id is None or is_open is None:
-        return jsonify({"error": "salon_id and is_open required"}), 400
-    try:
-        salon_ref = db.collection('salons').document(salon_id)
-        doc = salon_ref.get()
-        if not doc.exists or doc.to_dict().get('owner_id') != decoded['uid']:
-            return jsonify({"error": "Unauthorized"}), 403
-        
-        salon_ref.update({"is_open": bool(is_open)})
-        return jsonify({"message": f"Salon status updated to {'Open' if is_open else 'Closed'}"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
