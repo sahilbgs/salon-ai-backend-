@@ -77,5 +77,51 @@ def run_reminder_job():
                 except Exception as e:
                     print(f"Failed to send push notification: {e}")
 
+def send_morning_reminders():
+    """Notify users about their appointments scheduled for today."""
+    now = datetime.now()
+    today_str = now.strftime('%Y-%m-%d')
+
+    print(f"Sending morning reminders for {today_str}...")
+
+    bookings = db.collection('bookings')\
+        .where('date', '==', today_str)\
+        .where('status', '==', 'confirmed')\
+        .stream()
+
+    for b in bookings:
+        booking = b.to_dict()
+        fcm_token = booking.get('fcm_token')
+        token_num = booking.get('token_number')
+        
+        if not fcm_token:
+            # Try to get from user doc if missing from booking
+            user_doc = db.collection('users').document(booking.get('user_id')).get()
+            if user_doc.exists:
+                fcm_token = user_doc.to_dict().get('fcm_token')
+
+        if fcm_token:
+            salon_name = "the Salon"
+            s_doc = db.collection('salons').document(booking.get('salon_id')).get()
+            if s_doc.exists:
+                salon_name = s_doc.to_dict().get('name')
+
+            try:
+                msg = messaging.Message(
+                    notification=messaging.Notification(
+                        title="Today's Appointment 📅", 
+                        body=f"You have an appointment at {salon_name} today! Your token number is #{token_num}. We'll notify you when it's almost your turn."
+                    ),
+                    token=fcm_token
+                )
+                messaging.send(msg)
+                print(f"Sent morning reminder for Token #{token_num}")
+            except Exception as e:
+                print(f"Failed: {e}")
+
 if __name__ == "__main__":
-    run_reminder_job()
+    # If run in the morning (e.g., 8-9 AM), send morning reminders
+    if 8 <= datetime.now().hour <= 10:
+        send_morning_reminders()
+    else:
+        run_reminder_job()

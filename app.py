@@ -230,6 +230,7 @@ def book_appointment():
     salon_id, service_id = data.get('salon_id'), data.get('service_id')
     date, time_slot = data.get('date'), data.get('time')
     visitor_name = data.get('visitor_name', '').strip() or decoded.get('name', '')
+    fcm_token = data.get('fcm_token')
     if not all([salon_id, service_id, date, time_slot]):
         return jsonify({"error": "Missing fields"}), 400
     try:
@@ -242,6 +243,12 @@ def book_appointment():
         # Check if today is a closed day
         try:
             booking_date_obj = datetime.strptime(date, '%Y-%m-%d')
+            # Only allow today and tomorrow
+            today = datetime.now().date()
+            tomorrow = today + timedelta(days=1)
+            if booking_date_obj.date() < today or booking_date_obj.date() > tomorrow:
+                return jsonify({"error": "You can only book for today or tomorrow."}), 400
+
             # weekday() is 0-6 (Mon-Sun)
             if booking_date_obj.weekday() in salon_data.get('closed_days', []):
                 return jsonify({"error": f"Sorry, the salon is closed on this day ({booking_date_obj.strftime('%A')})"}), 400
@@ -271,7 +278,7 @@ def book_appointment():
         new_booking = {
             "user_id": uid, "salon_id": salon_id, "service_id": service_id,
             "date": date, "time": time_slot, "status": booking_status,
-            "token_number": token_number,
+            "token_number": token_number, "fcm_token": fcm_token,
             "visitor_name": visitor_name,
             "created_at": firestore.SERVER_TIMESTAMP
         }
@@ -824,6 +831,65 @@ def get_owner_salons():
             data['queue'] = q
             result.append(data)
         return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/owner/update-salon', methods=['POST'])
+def update_salon():
+    decoded, err = verify_token()
+    if err: return jsonify({"error": err}), 401
+    uid = decoded['uid']
+    if get_user_role(db, uid) != 'owner': return jsonify({"error": "Owners only"}), 403
+    data = request.json
+    salon_id = data.get('salon_id')
+    try:
+        doc_ref = db.collection('salons').document(salon_id)
+        doc = doc_ref.get()
+        if not doc.exists or doc.to_dict().get('owner_id') != uid:
+            return jsonify({"error": "Unauthorized"}), 403
+            
+        allowed = ['name', 'address', 'opening_time', 'closing_time', 'slot_duration', 'closed_days']
+        updates = {k: v for k, v in data.items() if k in allowed}
+        doc_ref.update(updates)
+        return jsonify({"message": "Salon info updated"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/owner/set-auto-confirm', methods=['POST'])
+def set_auto_confirm():
+    decoded, err = verify_token()
+    if err: return jsonify({"error": err}), 401
+    uid = decoded['uid']
+    if get_user_role(db, uid) != 'owner': return jsonify({"error": "Owners only"}), 403
+    data = request.json
+    salon_id = data.get('salon_id')
+    limit = data.get('limit', 10)
+    try:
+        doc_ref = db.collection('salons').document(salon_id)
+        doc = doc_ref.get()
+        if not doc.exists or doc.to_dict().get('owner_id') != uid:
+            return jsonify({"error": "Unauthorized"}), 403
+        doc_ref.update({"auto_confirm_limit": limit})
+        return jsonify({"message": f"Auto-confirm limit set to {limit}"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/owner/update-salon-status', methods=['POST'])
+def update_salon_status_owner():
+    decoded, err = verify_token()
+    if err: return jsonify({"error": err}), 401
+    uid = decoded['uid']
+    if get_user_role(db, uid) != 'owner': return jsonify({"error": "Owners only"}), 403
+    data = request.json
+    salon_id = data.get('salon_id')
+    is_open = data.get('is_open', True)
+    try:
+        doc_ref = db.collection('salons').document(salon_id)
+        doc = doc_ref.get()
+        if not doc.exists or doc.to_dict().get('owner_id') != uid:
+            return jsonify({"error": "Unauthorized"}), 403
+        doc_ref.update({"is_open": is_open})
+        return jsonify({"message": f"Salon status updated to {'Open' if is_open else 'Closed'}"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

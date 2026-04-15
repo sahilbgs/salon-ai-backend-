@@ -100,6 +100,13 @@ def advance_queue(db, salon_id):
         if bd.get('token_number') == new_current and bd.get('status') in ['confirmed', 'arrived']:
             b.reference.update({"status": "in_progress"})
 
+    # Notify upcoming customers
+    try:
+        from utils.notification_helpers import notify_queue_update
+        notify_queue_update(db, salon_id, new_current)
+    except Exception as e:
+        print(f"Notification error: {e}")
+
     return {"current_token": new_current, "qr_session": new_session, "last_token": last}, None
 
 def skip_token(db, salon_id):
