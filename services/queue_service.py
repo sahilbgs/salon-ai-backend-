@@ -5,11 +5,42 @@ import qrcode
 from firebase_admin import firestore
 
 def get_or_create_queue(db, salon_id):
-    """Get queue doc for a salon, create if doesn't exist."""
+    """Get queue doc for a salon, create if doesn't exist. Resets daily."""
+    import datetime
     ref = db.collection('queues').document(salon_id)
     doc = ref.get()
+    
+    now = datetime.datetime.now()
+    
     if doc.exists:
-        return ref, doc.to_dict()
+        data = doc.to_dict()
+        last_update = data.get('updated_at')
+        
+        # Check if reset is needed (different day)
+        is_new_day = False
+        if last_update:
+            # Handle both datetime objects and timestamps
+            if isinstance(last_update, datetime.datetime):
+                ut = last_update
+            else:
+                # Firestore timestamp helper usually returns datetime in Python SDK
+                ut = last_update
+            
+            if ut.date() != now.date():
+                is_new_day = True
+        
+        if is_new_day:
+            reset_data = {
+                "current_token": 0,
+                "last_token": 0,
+                "qr_session": str(uuid.uuid4())[:8],
+                "updated_at": firestore.SERVER_TIMESTAMP
+            }
+            ref.update(reset_data)
+            return ref, {**data, **reset_data}
+            
+        return ref, data
+
     initial = {
         "salon_id": salon_id,
         "current_token": 0,

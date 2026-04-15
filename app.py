@@ -165,7 +165,10 @@ def get_salons():
             return jsonify(_salons_cache["data"]), 200
 
     try:
-        salon_docs = list(db.collection('salons').where('status', '==', 'approved').stream())
+        # Fetch all approved salons (we will sort by is_open in Python)
+        salon_docs = list(db.collection('salons')
+                         .where('status', '==', 'approved')
+                         .stream())
 
         # ── Batch-fetch all queue docs in ONE read instead of N reads ──
         salon_ids = [doc.id for doc in salon_docs]
@@ -191,8 +194,8 @@ def get_salons():
             data['current_token'] = q.get('current_token', 0)
             salons.append(data)
 
-        if lat and lng:
-            salons.sort(key=lambda x: x.get('distance', float('inf')))
+        # Sort: Open salons first, then by distance
+        salons.sort(key=lambda x: (not x.get('is_open', True), x.get('distance', float('inf'))))
 
         # Update cache only for non-location responses
         if not lat and not lng:
@@ -230,6 +233,20 @@ def book_appointment():
     if not all([salon_id, service_id, date, time_slot]):
         return jsonify({"error": "Missing fields"}), 400
     try:
+        salon_doc = db.collection('salons').document(salon_id).get()
+        if not salon_doc.exists:
+            return jsonify({"error": "Salon not found"}), 404
+        
+        salon_data = salon_doc.to_dict()
+        
+        # Check if today is a closed day
+        try:
+            booking_date_obj = datetime.strptime(date, '%Y-%m-%d')
+            # weekday() is 0-6 (Mon-Sun)
+            if booking_date_obj.weekday() in salon_data.get('closed_days', []):
+                return jsonify({"error": f"Sorry, the salon is closed on this day ({booking_date_obj.strftime('%A')})"}), 400
+        except:
+            pass
         # No slot conflict check — shifts allow multiple bookings.
         # Everyone gets their own token in the queue.
         token_number = assign_token(db, salon_id)
@@ -448,6 +465,29 @@ def set_auto_confirm():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/owner/update-salon-status', methods=['POST'])
+def update_salon_status():
+    """Owner: toggle salon open/closed status."""
+    decoded, err = verify_token()
+    if err: return jsonify({"error": err}), 401
+    if get_user_role(db, decoded['uid']) != 'owner':
+        return jsonify({"error": "Owners only"}), 403
+    data = request.json
+    salon_id = data.get('salon_id')
+    is_open = data.get('is_open')
+    if salon_id is None or is_open is None:
+        return jsonify({"error": "salon_id and is_open required"}), 400
+    try:
+        salon_ref = db.collection('salons').document(salon_id)
+        doc = salon_ref.get()
+        if not doc.exists or doc.to_dict().get('owner_id') != decoded['uid']:
+            return jsonify({"error": "Unauthorized"}), 403
+        
+        salon_ref.update({"is_open": bool(is_open)})
+        return jsonify({"message": f"Salon status updated to {'Open' if is_open else 'Closed'}"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # ==================== QUEUE ====================
 
 @app.route('/api/queue/<salon_id>', methods=['GET'])
@@ -629,7 +669,8 @@ def create_salon():
             "opening_time": data.get('opening_time', "09:00"),
             "closing_time": data.get('closing_time', "20:00"),
             "slot_duration": data.get('slot_duration', 30),
-            "owner_id": uid, "status": "pending", "rating": 5.0
+            "owner_id": uid, "status": "pending", "rating": 5.0,
+            "is_open": True
         }
         _, doc_ref = db.collection('salons').add(new_salon)
         return jsonify({"message": "Salon created, pending approval", "id": doc_ref.id}), 201
