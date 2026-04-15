@@ -76,6 +76,28 @@ def send_notification(token, title, body):
         print(f"FCM Error: {e}")
 
 
+def send_topic_notification(topic, title, body, data=None):
+    """Send FCM notification to a topic (reaches all subscribed devices, even when app is closed)."""
+    try:
+        msg = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            android=messaging.AndroidConfig(
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    channel_id='luxe_salon_bookings',
+                    default_sound=True,
+                    default_vibrate_timings=True,
+                )
+            ),
+            data=data or {},
+            topic=topic,
+        )
+        messaging.send(msg)
+        print(f"Topic notification sent to: {topic}")
+    except Exception as e:
+        print(f"FCM Topic Error: {e}")
+
+
 # ==================== AUTH ====================
 
 @app.route('/api/auth', methods=['POST'])
@@ -189,17 +211,53 @@ def book_appointment():
             "visitor_name": visitor_name,
             "created_at": firestore.SERVER_TIMESTAMP
         }
+
+        # Resolve service name for notification
+        service_name = ''
+        service_names = []
+        service_ids = data.get('service_ids') or ([service_id] if service_id else [])
+        for sid in service_ids:
+            svc_doc = db.collection('services').document(sid).get()
+            if svc_doc.exists:
+                svc_name = svc_doc.to_dict().get('name', '')
+                if svc_name:
+                    service_names.append(svc_name)
+        service_name = ', '.join(service_names) if service_names else service_id or ''
+
+        # Persist service names in the booking document
+        new_booking['services'] = service_names if service_names else ([service_id] if service_id else [])
+        new_booking['service_name'] = service_name
+
         _, doc_ref = db.collection('bookings').add(new_booking)
 
-        # Notify owner
+        # ── Notify owner via FCM topic (works even when app is closed) ──
+        topic = f'salon_{salon_id}'
+        notif_title = '📅 New Appointment' if booking_status == 'confirmed' else '⚠️ Pending Approval'
+        notif_body_parts = [f'Token #{token_number}']
+        if visitor_name: notif_body_parts.append(visitor_name)
+        if service_name: notif_body_parts.append(service_name)
+        notif_body = ' · '.join(notif_body_parts)
+
+        send_topic_notification(
+            topic=topic,
+            title=notif_title,
+            body=notif_body,
+            data={
+                'token_number': str(token_number),
+                'customer_name': visitor_name,
+                'service': service_name,
+                'salon_id': salon_id,
+                'booking_status': booking_status,
+            }
+        )
+
+        # Also send to individual FCM token (legacy fallback)
         if salon_doc.exists:
             owner_id = salon_doc.to_dict().get('owner_id')
             if owner_id:
                 owner_user = db.collection('users').document(owner_id).get()
                 if owner_user.exists:
-                    notif_title = "New Booking" if booking_status == 'confirmed' else "⚠️ Pending Approval Required"
-                    send_notification(owner_user.to_dict().get('fcm_token'),
-                        notif_title, f"Token #{token_number} — {visitor_name} on {date} at {time_slot}")
+                    send_notification(owner_user.to_dict().get('fcm_token'), notif_title, notif_body)
 
         status_msg = "Booked successfully!" if booking_status == 'confirmed' else "Booking submitted — waiting for owner approval."
         return jsonify({
@@ -241,6 +299,30 @@ def cancel_booking():
         if not doc.exists or doc.to_dict().get('user_id') != decoded['uid']:
             return jsonify({"error": "Unauthorized"}), 403
         doc_ref.update({"status": "cancelled"})
+
+        # Notify owner about customer cancellation via topic
+        booking_data = doc.to_dict()
+        salon_id_from_booking = booking_data.get('salon_id', '')
+        visitor = booking_data.get('visitor_name', 'A customer')
+        token_num = booking_data.get('token_number', '')
+        svc = booking_data.get('service_name', '')
+
+        if salon_id_from_booking:
+            cancel_body_parts = [f'Token #{token_num}'] if token_num else []
+            cancel_body_parts.append(f'{visitor} cancelled')
+            if svc: cancel_body_parts.append(svc)
+            send_topic_notification(
+                topic=f'salon_{salon_id_from_booking}',
+                title='❌ Appointment Cancelled',
+                body=' · '.join(cancel_body_parts),
+                data={
+                    'token_number': str(token_num),
+                    'customer_name': visitor,
+                    'service': svc,
+                    'booking_status': 'cancelled',
+                }
+            )
+
         return jsonify({"message": "Cancelled"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
