@@ -15,10 +15,16 @@ def send_push_notification(fcm_token, title, body, data=None):
             android=messaging.AndroidConfig(
                 priority='high',
                 notification=messaging.AndroidNotification(
-                    channel_id='luxe_salon_queue',
+                    channel_id='luxe_salon_high_priority',
+                    sound='noti',
                     priority='high',
-                    default_sound=True,
+                    default_sound=False,
                     default_vibrate_timings=True,
+                )
+            ),
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(sound='noti.mp3')
                 )
             ),
             data=data or {},

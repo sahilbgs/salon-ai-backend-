@@ -441,13 +441,37 @@ def owner_clear_queue():
             "qr_session": str(__import__('uuid').uuid4())[:8],
             "updated_at": firestore.SERVER_TIMESTAMP
         })
-        # Archive all non-archived bookings during testing phase
-        all_docs = db.collection('bookings').where('salon_id', '==', salon_id).stream()
+
+        # Archive/Cancel active bookings for TODAY
+        all_docs = db.collection('bookings')\
+            .where('salon_id', '==', salon_id)\
+            .where('date', '==', today_str).stream()
+        
         count = 0
+        from utils.notification_helpers import send_push_notification
+        
         for d in all_docs:
-            d.reference.update({"archived": True})
-            count += 1
-        return jsonify({"message": f"Queue reset. {count} bookings archived."}), 200
+            bd = d.to_dict()
+            status = bd.get('status')
+            
+            # If active, mark as cancelled and notify
+            if status in ['confirmed', 'arrived', 'in_progress']:
+                d.reference.update({"status": "cancelled", "archived": True, "cancel_reason": "Queue reset by Salon"})
+                count += 1
+                
+                fcm_token = bd.get('fcm_token')
+                if fcm_token:
+                    send_push_notification(
+                        fcm_token,
+                        "Appointment Cancelled ⚠️",
+                        f"Your appointment at {salon_doc.to_dict().get('name')} was cancelled due to a queue reset. Please book again if needed.",
+                        data={"type": "cancellation"}
+                    )
+            else:
+                # Just archive non-active ones
+                d.reference.update({"archived": True})
+
+        return jsonify({"message": f"Queue reset. {count} active bookings cancelled and notified."}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
