@@ -9,7 +9,7 @@ from flask_cors import CORS
 from flask_compress import Compress
 import firebase_admin
 from firebase_admin import credentials, auth, firestore, messaging
-from datetime import datetime
+from datetime import datetime, timedelta
 from services.queue_service import (
     get_or_create_queue, assign_token, advance_queue, 
     skip_token, validate_qr_scan, generate_qr_image
@@ -242,19 +242,16 @@ def book_appointment():
         salon_data = salon_doc.to_dict()
         
         # Check if today is a closed day
-        try:
-            booking_date_obj = datetime.strptime(date, '%Y-%m-%d')
-            # Only allow today and tomorrow
-            today = datetime.now().date()
-            tomorrow = today + timedelta(days=1)
-            if booking_date_obj.date() < today or booking_date_obj.date() > tomorrow:
-                return jsonify({"error": "You can only book for today or tomorrow."}), 400
+        booking_date_obj = datetime.strptime(date, '%Y-%m-%d')
+        # Only allow today and tomorrow
+        today = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
+        if booking_date_obj.date() < today or booking_date_obj.date() > tomorrow:
+            return jsonify({"error": "You can only book for today or tomorrow."}), 400
 
-            # weekday() is 0-6 (Mon-Sun)
-            if booking_date_obj.weekday() in salon_data.get('closed_days', []):
-                return jsonify({"error": f"Sorry, the salon is closed on this day ({booking_date_obj.strftime('%A')})"}), 400
-        except:
-            pass
+        # weekday() is 0-6 (Mon-Sun)
+        if booking_date_obj.weekday() in salon_data.get('closed_days', []):
+            return jsonify({"error": f"Sorry, the salon is closed on this day ({booking_date_obj.strftime('%A')})"}), 400
         # No slot conflict check — shifts allow multiple bookings.
         # Everyone gets their own token in the queue.
         token_number = assign_token(db, salon_id, date)
@@ -834,7 +831,7 @@ def update_salon():
         if not doc.exists or doc.to_dict().get('owner_id') != uid:
             return jsonify({"error": "Unauthorized"}), 403
             
-        allowed = ['name', 'address', 'opening_time', 'closing_time', 'slot_duration', 'closed_days']
+        allowed = ['name', 'address', 'opening_time', 'closing_time', 'slot_duration', 'closed_days', 'auto_confirm_limit']
         updates = {k: v for k, v in data.items() if k in allowed}
         doc_ref.update(updates)
         return jsonify({"message": "Salon info updated"}), 200
