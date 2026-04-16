@@ -451,9 +451,6 @@ def owner_clear_queue():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 # ==================== QUEUE ====================
 
 @app.route('/api/queue/<salon_id>', methods=['GET'])
