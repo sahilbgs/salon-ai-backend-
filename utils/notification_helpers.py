@@ -2,7 +2,7 @@ from firebase_admin import messaging
 from datetime import datetime
 
 def send_push_notification(fcm_token, title, body, data=None):
-    """Send a push notification to a specific device."""
+    """Send a high-priority push notification to a specific device."""
     if not fcm_token:
         return False
     
@@ -11,6 +11,15 @@ def send_push_notification(fcm_token, title, body, data=None):
             notification=messaging.Notification(
                 title=title,
                 body=body
+            ),
+            android=messaging.AndroidConfig(
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    channel_id='luxe_salon_queue',
+                    priority='high',
+                    default_sound=True,
+                    default_vibrate_timings=True,
+                )
             ),
             data=data or {},
             token=fcm_token
@@ -22,12 +31,15 @@ def send_push_notification(fcm_token, title, body, data=None):
         print(f"Error sending push notification: {e}")
         return False
 
+
 def notify_queue_update(db, salon_id, current_token):
     """Notify upcoming customers in the queue."""
-    # Notify 5 tokens ahead
-    target5 = current_token + 5
+    # Notify current customer (Your turn!)
+    target0 = current_token
     # Notify 2 tokens ahead
     target2 = current_token + 2
+    # Notify 5 tokens ahead
+    target5 = current_token + 5
     
     # Query bookings for this salon today with these token numbers
     today_str = datetime.now().strftime('%Y-%m-%d')
@@ -36,7 +48,7 @@ def notify_queue_update(db, salon_id, current_token):
     bookings = db.collection('bookings') \
         .where('salon_id', '==', salon_id) \
         .where('date', '==', today_str) \
-        .where('token_number', 'in', [target2, target5]) \
+        .where('token_number', 'in', [target0, target2, target5]) \
         .stream()
         
     for b in bookings:
@@ -47,11 +59,12 @@ def notify_queue_update(db, salon_id, current_token):
         if not fcm_token:
             continue
             
-        if token_num == target5:
+        if token_num == target0:
             send_push_notification(
                 fcm_token,
-                "Head to Salon! 🏪",
-                f"Only 5 people ahead of you (Token #{token_num}). Start heading to the salon now!"
+                "IT'S YOUR TURN! 🔔",
+                f"Token #{token_num}, please proceed to the stylist now! YOUR TURN IS HERE! 🏃‍♂️💨",
+                data={"click_action": "FLUTTER_NOTIFICATION_CLICK", "type": "your_turn"}
             )
         elif token_num == target2:
             send_push_notification(
@@ -59,3 +72,10 @@ def notify_queue_update(db, salon_id, current_token):
                 "Almost your turn! 🏃‍♂️",
                 f"Only 2 people ahead (Token #{token_num}). Reach the salon ASAP and get your QR ready!"
             )
+        elif token_num == target5:
+            send_push_notification(
+                fcm_token,
+                "Head to Salon! 🏪",
+                f"Only 5 people ahead of you (Token #{token_num}). Start heading to the salon now!"
+            )
+

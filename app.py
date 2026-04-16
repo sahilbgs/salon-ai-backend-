@@ -172,12 +172,13 @@ def get_salons():
 
         # ── Batch-fetch all queue docs in ONE read instead of N reads ──
         salon_ids = [doc.id for doc in salon_docs]
-        queue_refs = [db.collection('queues').document(sid) for sid in salon_ids]
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        queue_refs = [db.collection('queues').document(f"{sid}_{today_str}") for sid in salon_ids]
         queue_snap_map = {}
         if queue_refs:
             for q_doc in db.get_all(queue_refs):
                 if q_doc.exists:
-                    queue_snap_map[q_doc.id] = q_doc.to_dict()
+                    queue_snap_map[q_doc.id.replace(f"_{today_str}", "")] = q_doc.to_dict()
 
         salons = []
         for doc in salon_docs:
@@ -256,7 +257,7 @@ def book_appointment():
             pass
         # No slot conflict check — shifts allow multiple bookings.
         # Everyone gets their own token in the queue.
-        token_number = assign_token(db, salon_id)
+        token_number = assign_token(db, salon_id, date)
 
         # Determine booking status based on auto-confirm limit
         salon_doc = db.collection('salons').document(salon_id).get()
@@ -354,8 +355,8 @@ def my_bookings():
             b = {"id": d.id, **d.to_dict()}
             if b.get('hidden_by_customer'): continue  # Skip cleared history
             # Add queue position info
-            if b.get('salon_id') and b.get('token_number'):
-                _, q = get_or_create_queue(db, b['salon_id'])
+            if b.get('salon_id') and b.get('token_number') and b.get('date'):
+                _, q = get_or_create_queue(db, b['salon_id'], b['date'])
                 b['current_token'] = q.get('current_token', 0)
                 b['wait_estimate'] = predict_wait(b['token_number'], q.get('current_token', 0))
             bookings.append(b)
@@ -432,8 +433,9 @@ def owner_clear_queue():
     if not salon_doc.exists or salon_doc.to_dict().get('owner_id') != decoded['uid']:
         return jsonify({"error": "Not your salon"}), 403
     try:
-        # Reset queue counters
-        ref = db.collection('queues').document(salon_id)
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        # Reset queue counters for today
+        ref = db.collection('queues').document(f"{salon_id}_{today_str}")
         ref.set({
             "current_token": 0, "last_token": 0,
             "qr_session": str(__import__('uuid').uuid4())[:8],
@@ -458,9 +460,14 @@ def owner_clear_queue():
 def get_queue(salon_id):
     if db is None: return jsonify({"error": "DB not initialized"}), 500
     try:
-        _, q = get_or_create_queue(db, salon_id)
-        # Get all active bookings for testing phase
-        all_docs = db.collection('bookings').where('salon_id', '==', salon_id).stream()
+        date_param = request.args.get('date')
+        today_str = date_param if date_param else datetime.now().strftime('%Y-%m-%d')
+        
+        _, q = get_or_create_queue(db, salon_id, today_str)
+        # Get all active bookings for this date
+        all_docs = db.collection('bookings')\
+            .where('salon_id', '==', salon_id)\
+            .where('date', '==', today_str).stream()
         bookings = []
         for b in all_docs:
             bd = b.to_dict()
@@ -784,7 +791,8 @@ def get_owner_salons():
         result = []
         for s in salons:
             data = {"id": s.id, **s.to_dict()}
-            _, q = get_or_create_queue(db, s.id)
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            _, q = get_or_create_queue(db, s.id, today_str)
             data['queue'] = q
             result.append(data)
         return jsonify(result), 200
