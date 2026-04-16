@@ -836,45 +836,6 @@ def set_auto_confirm():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/owner/update-salon', methods=['POST'])
-def update_salon():
-    decoded, err = verify_token()
-    if err: return jsonify({"error": err}), 401
-    uid = decoded['uid']
-    if get_user_role(db, uid) != 'owner': return jsonify({"error": "Owners only"}), 403
-    data = request.json
-    salon_id = data.get('salon_id')
-    try:
-        doc_ref = db.collection('salons').document(salon_id)
-        doc = doc_ref.get()
-        if not doc.exists or doc.to_dict().get('owner_id') != uid:
-            return jsonify({"error": "Unauthorized"}), 403
-            
-        allowed = ['name', 'address', 'opening_time', 'closing_time', 'slot_duration', 'closed_days']
-        updates = {k: v for k, v in data.items() if k in allowed}
-        doc_ref.update(updates)
-        return jsonify({"message": "Salon info updated"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/owner/set-auto-confirm', methods=['POST'])
-def set_auto_confirm():
-    decoded, err = verify_token()
-    if err: return jsonify({"error": err}), 401
-    uid = decoded['uid']
-    if get_user_role(db, uid) != 'owner': return jsonify({"error": "Owners only"}), 403
-    data = request.json
-    salon_id = data.get('salon_id')
-    limit = data.get('limit', 10)
-    try:
-        doc_ref = db.collection('salons').document(salon_id)
-        doc = doc_ref.get()
-        if not doc.exists or doc.to_dict().get('owner_id') != uid:
-            return jsonify({"error": "Unauthorized"}), 403
-        doc_ref.update({"auto_confirm_limit": limit})
-        return jsonify({"message": f"Auto-confirm limit set to {limit}"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/owner/update-salon-status', methods=['POST'])
 def update_salon_status_owner():
