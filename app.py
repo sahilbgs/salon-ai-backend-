@@ -709,6 +709,8 @@ def get_all_services():
         if salon_id_filter:
             svc_docs = db.collection('services').where('salon_id', '==', salon_id_filter).stream()
         else:
+            # If no filter, but we are an owner, maybe we should only see our own?
+            # For now, let's keep it as is for customers, but owner app should pass salon_id.
             svc_docs = db.collection('services').stream()
 
         services = []
@@ -732,8 +734,8 @@ def get_all_services():
                 svc['salon_address'] = salon_info.get('address', '')
                 svc['salon_status'] = salon_info.get('status', '')
 
-            # Only surface services from approved salons
-            if svc.get('salon_status', 'approved') != 'approved':
+            # Only surface services from approved salons (unless salon_id_filter is provided by owner)
+            if not salon_id_filter and svc.get('salon_status', 'approved') != 'approved':
                 continue
 
             services.append(svc)
@@ -795,8 +797,65 @@ def update_service(service_id):
         return jsonify({"message": "Service updated"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+@app.route('/api/owner/manual-book', methods=['POST'])
+def manual_book():
+    """Owner: manually add a customer who doesn't have the app/mobile."""
+    decoded, err = verify_token()
+    if err: return jsonify({"error": err}), 401
+    uid = decoded['uid']
+    if get_user_role(db, uid) != 'owner': return jsonify({"error": "Owners only"}), 403
+    
+    data = request.json
+    salon_id = data.get('salon_id')
+    visitor_name = data.get('visitor_name', 'Walk-in Customer')
+    service_ids = data.get('service_ids', [])
+    date = data.get('date', datetime.now().strftime('%Y-%m-%d'))
+    time_slot = data.get('time', datetime.now().strftime('%H:%M'))
 
+    if not salon_id: return jsonify({"error": "salon_id required"}), 400
 
+    try:
+        salon_doc = db.collection('salons').document(salon_id).get()
+        if not salon_doc.exists or salon_doc.to_dict().get('owner_id') != uid:
+            return jsonify({"error": "Unauthorized"}), 403
+
+        token_number = assign_token(db, salon_id, date)
+        
+        # Resolve service names
+        service_names = []
+        for sid in service_ids:
+            svc_doc = db.collection('services').document(sid).get()
+            if svc_doc.exists:
+                service_names.append(svc_doc.to_dict().get('name', ''))
+
+        new_booking = {
+            "user_id": f"manual_{uid}_{int(time.time())}", 
+            "salon_id": salon_id,
+            "visitor_name": visitor_name,
+            "service_ids": service_ids,
+            "services": service_names,
+            "service_name": ', '.join(service_names),
+            "date": date,
+            "time": time_slot,
+            "status": "confirmed", # Manual bookings are auto-confirmed
+            "token_number": token_number,
+            "is_manual": True,
+            "created_at": firestore.SERVER_TIMESTAMP
+        }
+        
+        _, doc_ref = db.collection('bookings').add(new_booking)
+        
+        # Update confirmed counter for the slot
+        slot_key = f"confirmed_count_{date}_{time_slot.replace(':', '')}"
+        db.collection('queues').document(salon_id).set({slot_key: firestore.Increment(1)}, merge=True)
+
+        return jsonify({
+            "message": "Manual booking added",
+            "id": doc_ref.id,
+            "token_number": token_number
+        }), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/owner/salons', methods=['GET'])
 def get_owner_salons():
