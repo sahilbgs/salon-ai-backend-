@@ -45,6 +45,16 @@ threading.Thread(target=_keep_alive, daemon=True).start()
 _salons_cache = {"data": None, "ts": 0}
 _salons_cache_lock = threading.Lock()  # BUG 11 FIX: Thread-safe cache access
 
+# ── Per-salon detail cache (5 min TTL) ──
+_salon_detail_cache = {}  # {salon_id: {"data": ..., "ts": ...}}
+_salon_detail_lock = threading.Lock()
+_SALON_DETAIL_TTL = 300  # 5 minutes
+
+# ── Services cache (2 min TTL, keyed by salon_id) ──
+_services_cache = {}  # {salon_id: {"data": [...], "ts": float}}
+_services_cache_lock = threading.Lock()
+_SERVICES_TTL = 120  # 2 minutes
+
 FIREBASE_KEY_PATH = os.environ.get("FIREBASE_KEY_PATH", os.path.join(os.path.dirname(__file__), "serviceAccountKey.json"))
 # Support multiple env var names for flexibility
 FIREBASE_KEY_JSON = os.environ.get("FIREBASE_KEY_JSON") or os.environ.get("FIREBASE_CREDENTIALS") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -213,6 +223,14 @@ def get_salons():
 @app.route('/api/salon/<salon_id>', methods=['GET'])
 def get_salon(salon_id):
     if db is None: return jsonify({"error": "DB not initialized"}), 500
+    now = time.time()
+    # Check in-memory cache first
+    with _salon_detail_lock:
+        cached = _salon_detail_cache.get(salon_id)
+        if cached and now - cached['ts'] < _SALON_DETAIL_TTL:
+            resp = jsonify(cached['data'])
+            resp.headers['Cache-Control'] = 'public, max-age=60'
+            return resp, 200
     try:
         salon_doc = db.collection('salons').document(salon_id).get()
         if not salon_doc.exists: return jsonify({"error": "Not found"}), 404
@@ -222,7 +240,12 @@ def get_salon(salon_id):
         data['services'] = [{"id": d.id, **d.to_dict()} for d in services_docs]
         _, q = get_or_create_queue(db, salon_id)
         data['queue'] = q
-        return jsonify(data), 200
+        # Store in cache
+        with _salon_detail_lock:
+            _salon_detail_cache[salon_id] = {"data": data, "ts": now}
+        resp = jsonify(data)
+        resp.headers['Cache-Control'] = 'public, max-age=60'
+        return resp, 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -283,16 +306,19 @@ def book_appointment():
             "created_at": firestore.SERVER_TIMESTAMP
         }
 
-        # Resolve service name for notification
+        # Resolve service name for notification — batch fetch if multiple IDs
         service_name = ''
         service_names = []
         service_ids = data.get('service_ids') or ([service_id] if service_id else [])
-        for sid in service_ids:
-            svc_doc = db.collection('services').document(sid).get()
-            if svc_doc.exists:
-                svc_name = svc_doc.to_dict().get('name', '')
-                if svc_name:
-                    service_names.append(svc_name)
+        if service_ids:
+            # Batch read all services in ONE call instead of N individual reads
+            svc_refs = [db.collection('services').document(sid) for sid in service_ids]
+            svc_docs = db.get_all(svc_refs)
+            for svc_doc in svc_docs:
+                if svc_doc.exists:
+                    svc_name = svc_doc.to_dict().get('name', '')
+                    if svc_name:
+                        service_names.append(svc_name)
         service_name = ', '.join(service_names) if service_names else service_id or ''
 
         # Persist service names in the booking document
@@ -351,15 +377,22 @@ def my_bookings():
     try:
         docs = db.collection('bookings').where('user_id', '==', decoded['uid']).stream()
         bookings = []
+        queue_cache = {}  # Avoid re-fetching same queue doc for multiple bookings
         for d in docs:
             b = {"id": d.id, **d.to_dict()}
             if b.get('hidden_by_customer'): continue  # Skip cleared history
-            # Add queue position info
+            # Add queue position info with local cache
             if b.get('salon_id') and b.get('token_number') and b.get('date'):
-                _, q = get_or_create_queue(db, b['salon_id'], b['date'])
+                cache_key = f"{b['salon_id']}_{b['date']}"
+                if cache_key not in queue_cache:
+                    _, q = get_or_create_queue(db, b['salon_id'], b['date'])
+                    queue_cache[cache_key] = q
+                q = queue_cache[cache_key]
                 b['current_token'] = q.get('current_token', 0)
                 b['wait_estimate'] = predict_wait(b['token_number'], q.get('current_token', 0))
             bookings.append(b)
+        # Sort by date descending for better UX
+        bookings.sort(key=lambda x: x.get('date', ''), reverse=True)
         return jsonify(bookings), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -516,9 +549,6 @@ def my_queue_position(salon_id):
         bookings = [b.to_dict() | {'id': b.id} for b in all_user_bookings
                     if b.to_dict().get('salon_id') == salon_id
                     and b.to_dict().get('date', '') == today_str]
-        
-        print(f"DEBUG my_queue_position: salon_id={salon_id}, uid={decoded['uid']}")
-        print(f"DEBUG my_queue_position: bookings length={len(bookings)}")
 
         if not bookings:
             return jsonify({"error": "No booking found at this salon"}), 404
@@ -532,8 +562,6 @@ def my_queue_position(salon_id):
                       if b.get('status') not in ['cancelled', 'completed', 'no_show', 'rejected']]
             my = active[0] if active else bookings[0]
             
-        print(f"DEBUG my_queue_position: selected booking={my.get('id')} with status={my.get('status')}")
-
         try:
             my_token = int(my.get('token_number', 0))
         except (ValueError, TypeError):
@@ -693,6 +721,13 @@ def add_service():
             "image_url": data.get('image_url', ''),
         }
         _, doc_ref = db.collection('services').add(svc)
+        # Invalidate caches for this salon
+        with _salon_detail_lock:
+            _salon_detail_cache.pop(salon_id, None)
+        with _services_cache_lock:
+            _services_cache.pop(salon_id, None)
+        with _salons_cache_lock:
+            _salons_cache.update({"data": None, "ts": 0})
         return jsonify({"message": "Service added", "id": doc_ref.id}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -753,9 +788,23 @@ def get_all_services():
 def get_salon_services(salon_id):
     """Get all services for a specific salon (dedicated endpoint, no auth required)."""
     if db is None: return jsonify({"error": "DB not initialized"}), 500
+    # Check services cache
+    now = time.time()
+    with _services_cache_lock:
+        cached = _services_cache.get(salon_id)
+        if cached and now - cached['ts'] < _SERVICES_TTL:
+            resp = jsonify(cached['data'])
+            resp.headers['Cache-Control'] = 'public, max-age=60'
+            return resp, 200
     try:
         docs = db.collection('services').where('salon_id', '==', salon_id).stream()
-        return jsonify([{"id": d.id, **d.to_dict()} for d in docs]), 200
+        services = [{"id": d.id, **d.to_dict()} for d in docs]
+        # Update cache
+        with _services_cache_lock:
+            _services_cache[salon_id] = {"data": services, "ts": now}
+        resp = jsonify(services)
+        resp.headers['Cache-Control'] = 'public, max-age=60'
+        return resp, 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -776,6 +825,12 @@ def delete_service(service_id):
         if not salon_doc.exists or salon_doc.to_dict().get('owner_id') != uid:
             return jsonify({"error": "Unauthorized"}), 403
         doc_ref.delete()
+        # Invalidate caches for this salon
+        salon_id = doc.to_dict().get('salon_id', '')
+        with _salon_detail_lock:
+            _salon_detail_cache.pop(salon_id, None)
+        with _services_cache_lock:
+            _services_cache.pop(salon_id, None)
         return jsonify({"message": "Service deleted"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -900,6 +955,11 @@ def update_salon():
         allowed = ['name', 'address', 'opening_time', 'closing_time', 'slot_duration', 'closed_days', 'auto_confirm_limit']
         updates = {k: v for k, v in data.items() if k in allowed}
         doc_ref.update(updates)
+        # Invalidate caches so clients see fresh data
+        with _salon_detail_lock:
+            _salon_detail_cache.pop(salon_id, None)
+        with _salons_cache_lock:
+            _salons_cache.update({"data": None, "ts": 0})
         return jsonify({"message": "Salon info updated"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -919,6 +979,8 @@ def set_auto_confirm():
         if not doc.exists or doc.to_dict().get('owner_id') != uid:
             return jsonify({"error": "Unauthorized"}), 403
         doc_ref.update({"auto_confirm_limit": limit})
+        with _salon_detail_lock:
+            _salon_detail_cache.pop(salon_id, None)
         return jsonify({"message": f"Auto-confirm limit set to {limit}"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -939,6 +1001,10 @@ def update_salon_status_owner():
         if not doc.exists or doc.to_dict().get('owner_id') != uid:
             return jsonify({"error": "Unauthorized"}), 403
         doc_ref.update({"is_open": is_open})
+        with _salon_detail_lock:
+            _salon_detail_cache.pop(salon_id, None)
+        with _salons_cache_lock:
+            _salons_cache.update({"data": None, "ts": 0})
         return jsonify({"message": f"Salon status updated to {'Open' if is_open else 'Closed'}"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1058,14 +1124,24 @@ def ai_recommend():
     lng = request.args.get('lng', type=float)
     if db is None: return jsonify({"error": "DB not initialized"}), 500
     try:
-        docs = db.collection('salons').where('status', '==', 'approved').stream()
-        salons = []
-        for doc in docs:
-            data = doc.to_dict()
-            data['id'] = doc.id
-            _, q = get_or_create_queue(db, doc.id)
-            data['queue_length'] = q.get('last_token',0) - q.get('current_token',0)
-            salons.append(data)
+        # Reuse salon cache if available to avoid redundant Firestore reads
+        now = time.time()
+        with _salons_cache_lock:
+            cached = _salons_cache.get('data')
+            cache_fresh = cached and now - _salons_cache.get('ts', 0) < 30
+        
+        if cache_fresh and cached:
+            salons = [{**s} for s in cached]  # shallow copy
+        else:
+            docs = db.collection('salons').where('status', '==', 'approved').stream()
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            salons = []
+            for doc in docs:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                _, q = get_or_create_queue(db, doc.id, today_str)
+                data['queue_length'] = q.get('last_token', 0) - q.get('current_token', 0)
+                salons.append(data)
         result = recommend_salons(salons, lat, lng)
         return jsonify(result[:5]), 200
     except Exception as e:
