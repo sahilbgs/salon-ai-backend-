@@ -199,17 +199,17 @@ def get_salons():
             if lat and lng and 'location' in data:
                 slat, slng = data['location'].get('lat'), data['location'].get('lng')
                 # BUG 12 FIX: Use 'is not None' so lat/lng=0 (valid coords) aren't skipped
-                data['distance'] = haversine(lat, lng, slat, slng) if (slat is not None and slng is not None) else float('inf')
+                data['distance'] = haversine(lat, lng, slat, slng) if (slat is not None and slng is not None) else None
             else:
-                data['distance'] = float('inf')
+                data['distance'] = None
             # Attach queue info from pre-fetched batch
             q = queue_snap_map.get(doc.id, {})
             data['queue_length'] = q.get('last_token', 0) - q.get('current_token', 0)
             data['current_token'] = q.get('current_token', 0)
             salons.append(data)
 
-        # Sort: Open salons first, then by distance
-        salons.sort(key=lambda x: (not x.get('is_open', True), x.get('distance', float('inf'))))
+        # Sort: Open salons first, then by distance (None = no location = sort last)
+        salons.sort(key=lambda x: (not x.get('is_open', True), x.get('distance') if x.get('distance') is not None else 99999))
 
         # Update cache only for non-location responses
         if not lat and not lng:
