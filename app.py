@@ -1076,12 +1076,49 @@ def admin_salon_action(action):
     decoded, err = verify_token()
     if err: return jsonify({"error": err}), 401
     if get_user_role(db, decoded['uid']) != 'admin': return jsonify({"error": "Admins only"}), 403
-    if action not in ['approve', 'reject']: return jsonify({"error": "Invalid action"}), 400
+    if action not in ['approve', 'reject', 'delete']: return jsonify({"error": "Invalid action"}), 400
     salon_id = request.json.get('salon_id')
+    if not salon_id: return jsonify({"error": "salon_id required"}), 400
     try:
-        status = "approved" if action == "approve" else "rejected"
-        db.collection('salons').document(salon_id).update({"status": status})
-        return jsonify({"message": f"Salon {status}"}), 200
+        if action == 'delete':
+            # Delete all services for this salon
+            svc_docs = list(db.collection('services').where('salon_id', '==', salon_id).stream())
+            for svc in svc_docs:
+                svc.reference.delete()
+            # Delete all bookings for this salon
+            booking_docs = list(db.collection('bookings').where('salon_id', '==', salon_id).stream())
+            for bk in booking_docs:
+                bk.reference.delete()
+            # Delete queue docs for this salon (today + recent dates)
+            from datetime import date, timedelta
+            for days_offset in range(0, 7):
+                d = (date.today() - timedelta(days=days_offset)).strftime('%Y-%m-%d')
+                q_ref = db.collection('queues').document(f"{salon_id}_{d}")
+                if q_ref.get().exists:
+                    q_ref.delete()
+            # Also delete the undated queue doc if it exists
+            undated_ref = db.collection('queues').document(salon_id)
+            if undated_ref.get().exists:
+                undated_ref.delete()
+            # Delete the salon itself
+            db.collection('salons').document(salon_id).delete()
+            # Invalidate caches
+            with _salon_detail_lock:
+                _salon_detail_cache.pop(salon_id, None)
+            with _services_cache_lock:
+                _services_cache.pop(salon_id, None)
+            with _salons_cache_lock:
+                _salons_cache.update({"data": None, "ts": 0})
+            return jsonify({"message": f"Salon and all associated data deleted ({len(svc_docs)} services, {len(booking_docs)} bookings)"}), 200
+        else:
+            status = "approved" if action == "approve" else "rejected"
+            db.collection('salons').document(salon_id).update({"status": status})
+            # Invalidate caches
+            with _salon_detail_lock:
+                _salon_detail_cache.pop(salon_id, None)
+            with _salons_cache_lock:
+                _salons_cache.update({"data": None, "ts": 0})
+            return jsonify({"message": f"Salon {status}"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
