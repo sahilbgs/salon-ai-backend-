@@ -16,14 +16,16 @@ FIREBASE_KEY_PATH = os.environ.get(
 )
 
 try:
-    if FIREBASE_KEY_JSON:
-        key_data = json.loads(FIREBASE_KEY_JSON)
-        cred = credentials.Certificate(key_data)
-    elif os.path.exists(FIREBASE_KEY_PATH):
-        cred = credentials.Certificate(FIREBASE_KEY_PATH)
-    else:
-        raise FileNotFoundError(f"No Firebase credentials found (tried env var and {FIREBASE_KEY_PATH})")
-    firebase_admin.initialize_app(cred)
+    # Check if Firebase is already initialized (avoids crash when imported from app.py)
+    if not firebase_admin._apps:
+        if FIREBASE_KEY_JSON:
+            key_data = json.loads(FIREBASE_KEY_JSON)
+            cred = credentials.Certificate(key_data)
+        elif os.path.exists(FIREBASE_KEY_PATH):
+            cred = credentials.Certificate(FIREBASE_KEY_PATH)
+        else:
+            raise FileNotFoundError(f"No Firebase credentials found (tried env var and {FIREBASE_KEY_PATH})")
+        firebase_admin.initialize_app(cred)
     db = firestore.client()
     print("Database connected for Reminder Cron Job.")
 except Exception as e:
@@ -49,7 +51,8 @@ def run_reminder_job():
         booking = b.to_dict()
         b_time = booking.get('time')
         
-        if b_time and b_time.startswith(target_time_str[:2]):
+        # Compare full HH:MM (not just hour prefix which mismatches '1' vs '10','11','12')
+        if b_time and b_time[:5] == target_time_str[:5]:
             
             user_doc = db.collection('users').document(booking.get('user_id')).get()
             if not user_doc.exists: continue

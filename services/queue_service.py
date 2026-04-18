@@ -30,18 +30,20 @@ def get_or_create_queue(db, salon_id, date_str=None):
     return ref, initial
 
 def assign_token(db, salon_id, date_str=None):
-    """Assign next token number for a specific date. Each day starts from 1."""
+    """Assign next token number for a specific date. Each day starts from 1.
+    Uses Firestore Increment for atomic operation — prevents race conditions."""
     ref, queue = get_or_create_queue(db, salon_id, date_str)
-    new_token = queue.get('last_token', 0) + 1
     update = {
-        "last_token": new_token,
+        "last_token": firestore.Increment(1),
         "updated_at": firestore.SERVER_TIMESTAMP
     }
     # Ensure qr_session is set so QR displays immediately for token #1
     if not queue.get('qr_session'):
         update["qr_session"] = str(uuid.uuid4())[:8]
     ref.update(update)
-    return new_token
+    # Read back the incremented value
+    refreshed = ref.get().to_dict()
+    return refreshed.get('last_token', 1)
 
 def advance_queue(db, salon_id, date_str=None):
     """Move to next token for a specific date (default today)."""

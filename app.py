@@ -16,6 +16,8 @@ from services.queue_service import (
 )
 from services.ai_service import predict_wait, recommend_salons
 from utils.auth_helpers import verify_token, get_user_role, haversine
+# BUG 20 FIX: Single notification import — no more duplicate inline send_notification
+from utils.notification_helpers import send_push_notification, notify_queue_update
 
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend')
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='')
@@ -41,6 +43,7 @@ threading.Thread(target=_keep_alive, daemon=True).start()
 
 # ── Simple 30-second in-memory cache for /api/salons (non-location requests) ──
 _salons_cache = {"data": None, "ts": 0}
+_salons_cache_lock = threading.Lock()  # BUG 11 FIX: Thread-safe cache access
 
 FIREBASE_KEY_PATH = os.environ.get("FIREBASE_KEY_PATH", os.path.join(os.path.dirname(__file__), "serviceAccountKey.json"))
 # Support multiple env var names for flexibility
@@ -93,12 +96,8 @@ def health_check():
     }), 200
 
 def send_notification(token, title, body):
-    if not token: return
-    try:
-        msg = messaging.Message(notification=messaging.Notification(title=title, body=body), token=token)
-        messaging.send(msg)
-    except Exception as e:
-        print(f"FCM Error: {e}")
+    """Wrapper for backward compatibility — delegates to send_push_notification."""
+    return send_push_notification(token, title, body)
 
 
 def send_topic_notification(topic, title, body, data=None):
@@ -161,8 +160,9 @@ def get_salons():
     # Return cached response for non-location requests (avoids Firestore reads)
     now = time.time()
     if not lat and not lng:
-        if _salons_cache["data"] and now - _salons_cache["ts"] < 30:
-            return jsonify(_salons_cache["data"]), 200
+        with _salons_cache_lock:
+            if _salons_cache["data"] and now - _salons_cache["ts"] < 30:
+                return jsonify(_salons_cache["data"]), 200
 
     try:
         # Fetch all approved salons (we will sort by is_open in Python)
@@ -178,7 +178,9 @@ def get_salons():
         if queue_refs:
             for q_doc in db.get_all(queue_refs):
                 if q_doc.exists:
-                    queue_snap_map[q_doc.id.replace(f"_{today_str}", "")] = q_doc.to_dict()
+                    # BUG 13 FIX: Use rsplit to only strip trailing date suffix
+                    salon_key = q_doc.id.rsplit(f"_{today_str}", 1)[0]
+                    queue_snap_map[salon_key] = q_doc.to_dict()
 
         salons = []
         for doc in salon_docs:
@@ -186,7 +188,8 @@ def get_salons():
             data['id'] = doc.id
             if lat and lng and 'location' in data:
                 slat, slng = data['location'].get('lat'), data['location'].get('lng')
-                data['distance'] = haversine(lat, lng, slat, slng) if slat and slng else float('inf')
+                # BUG 12 FIX: Use 'is not None' so lat/lng=0 (valid coords) aren't skipped
+                data['distance'] = haversine(lat, lng, slat, slng) if (slat is not None and slng is not None) else float('inf')
             else:
                 data['distance'] = float('inf')
             # Attach queue info from pre-fetched batch
@@ -200,7 +203,8 @@ def get_salons():
 
         # Update cache only for non-location responses
         if not lat and not lng:
-            _salons_cache.update({"data": salons, "ts": now})
+            with _salons_cache_lock:
+                _salons_cache.update({"data": salons, "ts": now})
 
         return jsonify(salons), 200
     except Exception as e:
@@ -257,13 +261,11 @@ def book_appointment():
         token_number = assign_token(db, salon_id, date)
 
         # Determine booking status based on auto-confirm limit
-        salon_doc = db.collection('salons').document(salon_id).get()
-        auto_confirm_limit = 10  # default
-        if salon_doc.exists:
-            auto_confirm_limit = salon_doc.to_dict().get('auto_confirm_limit', 10)
+        # BUG 3 FIX: Reuse salon_doc from line 238 instead of re-fetching
+        auto_confirm_limit = salon_data.get('auto_confirm_limit', 10)
 
-        # Count confirmed bookings for this slot from the queue doc's counter (zero extra reads)
-        queue_ref = db.collection('queues').document(salon_id)
+        # BUG 2 FIX: Use date-suffixed queue doc ID (matches get_or_create_queue format)
+        queue_ref = db.collection('queues').document(f"{salon_id}_{date}")
         queue_doc = queue_ref.get()
         slot_key = f"confirmed_count_{date}_{time_slot.replace(':', '')}"
         confirmed_count = 0
@@ -299,9 +301,11 @@ def book_appointment():
 
         _, doc_ref = db.collection('bookings').add(new_booking)
 
-        # Increment per-slot confirmed counter on the queue doc (zero-cost, no extra reads)
+        # Increment per-slot confirmed counter on the date-suffixed queue doc
         if booking_status in ('confirmed', 'in_progress', 'arrived'):
-            queue_ref.set({slot_key: firestore.Increment(1)}, merge=True)
+            db.collection('queues').document(f"{salon_id}_{date}").set(
+                {slot_key: firestore.Increment(1)}, merge=True
+            )
 
         # ── Notify owner via FCM topic (works even when app is closed) ──
         topic = f'salon_{salon_id}'
@@ -325,12 +329,11 @@ def book_appointment():
         )
 
         # Also send to individual FCM token (legacy fallback)
-        if salon_doc.exists:
-            owner_id = salon_doc.to_dict().get('owner_id')
-            if owner_id:
-                owner_user = db.collection('users').document(owner_id).get()
-                if owner_user.exists:
-                    send_notification(owner_user.to_dict().get('fcm_token'), notif_title, notif_body)
+        owner_id = salon_data.get('owner_id')
+        if owner_id:
+            owner_user = db.collection('users').document(owner_id).get()
+            if owner_user.exists:
+                send_notification(owner_user.to_dict().get('fcm_token'), notif_title, notif_body)
 
         status_msg = "Booked successfully!" if booking_status == 'confirmed' else "Booking submitted — waiting for owner approval."
         return jsonify({
@@ -445,7 +448,7 @@ def owner_clear_queue():
             .where('date', '==', today_str).stream()
         
         count = 0
-        from utils.notification_helpers import send_push_notification
+        # BUG 20 FIX: Use top-level import instead of inline import
         
         for d in all_docs:
             bd = d.to_dict()
@@ -504,13 +507,15 @@ def my_queue_position(salon_id):
     try:
         _, q = get_or_create_queue(db, salon_id)
         token_param = request.args.get('token', type=int)
+        today_str = datetime.now().strftime('%Y-%m-%d')
         # Single-field query to avoid composite index requirement
         all_user_bookings = db.collection('bookings')\
             .where('user_id', '==', decoded['uid']).stream()
 
-        # Testing phase: allow all dates
+        # BUG 15 FIX: Filter by salon AND today's date to avoid stale position data
         bookings = [b.to_dict() | {'id': b.id} for b in all_user_bookings
-                    if b.to_dict().get('salon_id') == salon_id]
+                    if b.to_dict().get('salon_id') == salon_id
+                    and b.to_dict().get('date', '') == today_str]
         
         print(f"DEBUG my_queue_position: salon_id={salon_id}, uid={decoded['uid']}")
         print(f"DEBUG my_queue_position: bookings length={len(bookings)}")
@@ -845,9 +850,11 @@ def manual_book():
         
         _, doc_ref = db.collection('bookings').add(new_booking)
         
-        # Update confirmed counter for the slot
+        # BUG 2 FIX: Use date-suffixed queue doc ID (matches get_or_create_queue format)
         slot_key = f"confirmed_count_{date}_{time_slot.replace(':', '')}"
-        db.collection('queues').document(salon_id).set({slot_key: firestore.Increment(1)}, merge=True)
+        db.collection('queues').document(f"{salon_id}_{date}").set(
+            {slot_key: firestore.Increment(1)}, merge=True
+        )
 
         return jsonify({
             "message": "Manual booking added",
@@ -946,9 +953,13 @@ def get_owner_bookings():
         salons = list(db.collection('salons').where('owner_id', '==', uid).stream())
         salon_ids = [s.id for s in salons]
         if not salon_ids: return jsonify([]), 200
+        # BUG 22 FIX: Filter by date (default today) to avoid fetching all historical bookings
+        date_filter = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
         bookings = []
         for s_id in salon_ids:
-            b_docs = db.collection('bookings').where('salon_id', '==', s_id).stream()
+            b_docs = db.collection('bookings')\
+                .where('salon_id', '==', s_id)\
+                .where('date', '==', date_filter).stream()
             bookings.extend([{"id": d.id, **d.to_dict()} for d in b_docs])
         return jsonify(bookings), 200
     except Exception as e:
@@ -962,6 +973,10 @@ def update_booking_status():
     if get_user_role(db, uid) != 'owner': return jsonify({"error": "Owners only"}), 403
     data = request.json
     booking_id, status = data.get('booking_id'), data.get('status')
+    # BUG 17 FIX: Validate status against allowed values
+    ALLOWED_STATUSES = {'confirmed', 'cancelled', 'completed', 'in_progress', 'arrived', 'pending', 'rejected', 'no_show'}
+    if status not in ALLOWED_STATUSES:
+        return jsonify({"error": f"Invalid status '{status}'. Allowed: {', '.join(sorted(ALLOWED_STATUSES))}"}), 400
     try:
         doc_ref = db.collection('bookings').document(booking_id)
         doc = doc_ref.get()
@@ -1021,14 +1036,16 @@ def admin_stats():
     if err: return jsonify({"error": err}), 401
     if get_user_role(db, decoded['uid']) != 'admin': return jsonify({"error": "Admins only"}), 403
     try:
+        # BUG 16 FIX: Only count today's bookings instead of loading entire history into memory
         users = len(list(db.collection('users').stream()))
         salons = len(list(db.collection('salons').stream()))
-        bookings = list(db.collection('bookings').stream())
-        total_bookings = len(bookings)
-        active = sum(1 for b in bookings if b.to_dict().get('status') in ['confirmed','in_progress','arrived'])
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        today_bookings = list(db.collection('bookings').where('date', '==', today_str).stream())
+        total_today = len(today_bookings)
+        active = sum(1 for b in today_bookings if b.to_dict().get('status') in ['confirmed','in_progress','arrived'])
         return jsonify({
             "total_users": users, "total_salons": salons,
-            "total_bookings": total_bookings, "active_bookings": active
+            "total_bookings_today": total_today, "active_bookings": active
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500

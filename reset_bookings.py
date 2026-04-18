@@ -26,6 +26,14 @@ def delete_collection(col_name):
         doc.reference.delete()
     print(f"  {col_name}: deleted {len(docs)} documents")
 
+# BUG 23 FIX: Add confirmation prompt to prevent accidental data wipe
+print("\n⚠️  WARNING: This will DELETE all bookings and queues from Firestore!")
+print("   Users, salons, and services will NOT be affected.")
+confirm = input("\nType 'DELETE' to confirm: ").strip()
+if confirm != 'DELETE':
+    print("Aborted. No data was changed.")
+    sys.exit(0)
+
 print("\nResetting Firestore data...")
 print("Deleting bookings...")
 delete_collection('bookings')
